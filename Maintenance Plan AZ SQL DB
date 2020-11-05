@@ -1,0 +1,228 @@
+Azure SQL Database requires that you update statistics, and find missing indexes with a certain frequency, according to how much data modification happens on your tables. The less logical reads your queries make, the less resources they will require from Azure SQL Database. Updating statistics, finding missing indexes, will help you decrease the number of logical reads, and improve general database performance.
+ 
+To monitor the system for high DTU components usage (CPU, IO, T-Log) you can use the following DMVs:
+
+This query will give you the 5-minute averages of resource usage for the database(s) so you can see if there was an extended timeframe of resource usage or the size of the database.
+ 
+-- Run against master
+SELECT * FROM SYS.RESOURCE_STATS
+WHERE DATABASE_NAME = '<YOUR_DATABASE_NAME>' 
+ 
+Unlike the above query, this one only provides information for the past hour on resource usage and must be ran directly against the database. It will provide a more granular view of the resource percentages used as it is broken into 15 second intervals.
+
+-- RUN AGAINST THE DATABASE WITH THE PERFORMANCE ISSUE
+SELECT * FROM SYS.DM_DB_RESOURCE_STATS
+ 
+The closer to 100% any of these DTU components get (CPU, IO , TLog) the more issues you will get. 
+
+There are at least two different ways to resolve this problem. Update statistics, defrag indexes, and add missing indexes, or increase the service size to add more hardware capabilities to your application while you work to decrease the footprint of it on your database.
+ 
+Here are the queries and articles about these steps. Please follow them, update stats, defrag indexes, and add any missing indexes that would decrease the amount of logical reads your application is performing. These, in turn, will decrease the amount of CPU required to query your database.
+ 
+ 
+Action Plan
+1.- Update all your tables data distribution statistics, with a 100% sampling rate (Fullscan). This data is used by the SQL query optimizer to select an execution plan for the queries, and it’s vital that the statistics are updated to get effective execution plans.
+ 
+We recommend updating statistics on a regular basis based on how often data changes or is inserted. It could be necessary to update them daily, every other day, or weekly, etc.
+ 
+Connect to your database and run the following to update all stats in the database in one step.
+---------------------------------------------------------------------
+-- Update ALL Statistics WITH FULLSCAN 
+-- THIS WILL UPDATE ALL THE STATISTICS ON ALL THE TABLES IN YOUR DATABASE.
+-- REMOVE THE COMMENTS FROM EXEC SP_EXECUTESQL IN ORDER TO HAVE THE COMMANDS ACTUALLY UPDATE STATS, INSTEAD OF JUST PRINTING THEM.
+SET NOCOUNT ON
+GO
+ 
+DECLARE UPDATESTATS CURSOR FOR
+SELECT TABLE_SCHEMA, TABLE_NAME  
+FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_TYPE = 'BASE TABLE'
+OPEN UPDATESTATS
+ 
+DECLARE @TABLESCHEMA NVARCHAR(128)
+DECLARE @TABLENAME NVARCHAR(128)
+DECLARE @STATEMENT NVARCHAR(300)
+ 
+FETCH NEXT FROM UPDATESTATS INTO @TABLESCHEMA, @TABLENAME
+ 
+WHILE (@@FETCH_STATUS = 0)
+BEGIN
+   SET @STATEMENT = 'UPDATE STATISTICS '  + '[' + @TABLESCHEMA + ']' + '.' + '[' + @TABLENAME + ']' + ' WITH FULLSCAN'
+   PRINT @STATEMENT -- COMMENT THIS PRINT STATEMENT TO PREVENT IT FROM PRINTING WHENEVER YOU ARE READY TO EXECUTE THE COMMAND BELOW.
+  --EXEC SP_EXECUTESQL @STATEMENT -- REMOVE THE COMMENT ON THE BEGINNING OF THIS LINE TO RUN THE COMMANDS 
+   FETCH NEXT FROM UPDATESTATS INTO @TABLESCHEMA, @TABLENAME
+END
+ 
+CLOSE UPDATESTATS
+DEALLOCATE UPDATESTATS
+GO
+SET NOCOUNT OFF
+GO
+ 
+UPDATE STATISTICS (Transact-SQL)
+https://docs.microsoft.com/en-us/sql/t-sql/statements/update-statistics-transact-sql
+ 
+
+ 
+2.- Check the current index fragmentation state. Logical and physical fragmentation cannot be avoided as time passes and as data is deleted/inserted in the tables, and a high fragmentation severely affects performance, causing delays and an increased number of needed reads to access the data.
+ 
+We recommend starting with a check and rebuild now, and then regularly check fragmentation to keep it in line. We recommend rebuilding all indexes bigger than 1000 pages that present fragmentation percent higher than 25%.
+ 
+Connected to your database:
+ 
+-- CHECK INDEX FRAGMENTATION %
+SELECT
+OBJECT_NAME(PS.OBJECT_ID) AS TABLENAME
+,I.NAME AS INDEXNAME
+,IPS.AVG_FRAGMENTATION_IN_PERCENT
+,IPS.FRAGMENT_COUNT
+,IPS.PAGE_COUNT
+,IPS.INDEX_TYPE_DESC
+,IPS.AVG_FRAGMENT_SIZE_IN_PAGES
+FROM SYS.DM_DB_PARTITION_STATS PS
+INNER JOIN SYS.INDEXES I
+ON  PS.OBJECT_ID = I.OBJECT_ID
+AND PS.INDEX_ID = I.INDEX_ID
+CROSS APPLY SYS.DM_DB_INDEX_PHYSICAL_STATS(DB_ID(), PS.OBJECT_ID, PS.INDEX_ID, NULL, 'LIMITED') IPS
+WHERE AVG_FRAGMENTATION_IN_PERCENT >= 25 AND PAGE_COUNT > 999
+ORDER BY PS.OBJECT_ID, PS.INDEX_ID
+ 
+ 
+3.- Detecting missing indexes.
+ 
+After doing steps 1 and 2, allow for several hours of normal workload and activity. The reason for this is that this step would not contain accurate data with outdated statistics.
+ 
+After several hours of normal activity, check to see if the SQL engine reports any missing indexes. Proper indexing drastically reduces the time and read IOPS needed to query data.
+ 
+The following query returns information from the DMVs (Dynamic Management Views) related to Missing indexes, which report the list of indexes that the Query Optimizer points out as necessary in order to improve the current average workloads.
+The column "improvement_measure" is an indication of the improvement (estimated) that will occur if the index is created. It is a unitless number, and its meaning is relative to the same number for the other indexes suggested in the list.
+This measure is a combination of columns avg_total_user_cost, avg_user_impact, user_seeks, and user_scans in sys.dm_db_missing_index_group_stats. 
+ 
+This query should be executed against the user database that is being analyzed.
+ 
+Missing Indexes 
+
+DECLARE @RUNTIME DATETIME 
+SET @RUNTIME = GETDATE() 
+SELECT CONVERT (VARCHAR, @RUNTIME, 126) AS RUNTIME,  
+MIG.INDEX_GROUP_HANDLE, MID.INDEX_HANDLE,  
+CONVERT (DECIMAL (28,1), MIGS.AVG_TOTAL_USER_COST * MIGS.AVG_USER_IMPACT * (MIGS.USER_SEEKS + MIGS.USER_SCANS)) AS IMPROVEMENT_MEASURE,  
+'CREATE INDEX MISSING_INDEX_' + CONVERT (VARCHAR, MIG.INDEX_GROUP_HANDLE) + '_' + CONVERT (VARCHAR, MID.INDEX_HANDLE)  
++ ' ON ' + MID.STATEMENT  
++ ' (' + ISNULL (MID.EQUALITY_COLUMNS,'')  
++ CASE WHEN MID.EQUALITY_COLUMNS IS NOT NULL AND MID.INEQUALITY_COLUMNS IS NOT NULL THEN ',' ELSE '' END + ISNULL (MID.INEQUALITY_COLUMNS, '') 
++ ')' 
++ ISNULL (' INCLUDE (' + MID.INCLUDED_COLUMNS + ')', '') AS CREATE_INDEX_STATEMENT,  
+MIGS.*, MID.DATABASE_ID, MID.[OBJECT_ID] 
+FROM SYS.DM_DB_MISSING_INDEX_GROUPS MIG 
+INNER JOIN SYS.DM_DB_MISSING_INDEX_GROUP_STATS MIGS ON MIGS.GROUP_HANDLE = MIG.INDEX_GROUP_HANDLE 
+INNER JOIN SYS.DM_DB_MISSING_INDEX_DETAILS MID ON MIG.INDEX_HANDLE = MID.INDEX_HANDLE 
+WHERE CONVERT (DECIMAL (28,1), MIGS.AVG_TOTAL_USER_COST * MIGS.AVG_USER_IMPACT * (MIGS.USER_SEEKS + MIGS.USER_SCANS)) > 10 
+ORDER BY MIGS.AVG_TOTAL_USER_COST * MIGS.AVG_USER_IMPACT * (MIGS.USER_SEEKS + MIGS.USER_SCANS) DESC 
+ 
+The column create_index_statement contains the CREATE INDEX sentences that you can directly execute to create the suggested index.
+The list is ordered by improvement_measure from highest to lowest impact. Normally we create the group of new indexes listed as having the most impact, relative to the others.
+You can change the “missing_index….” names for another name of your choosing.
+ 
+CREATE INDEX (Transact-SQL)
+https://docs.microsoft.com/en-us/sql/t-sql/statements/create-index-transact-sql
+ 
+--You also have the SQL Database Advisor in the Azure Portal, that allows you to review and implement some recommendations for existing Databases, that can improve performance for current workloads.
+ 
+SQL Database Advisor using the Azure portal
+https://docs.microsoft.com/en-us/azure/sql-database/sql-database-advisor-portal
+ 
+SQL Database Advisor
+https://docs.microsoft.com/en-us/azure/sql-database/sql-database-advisor
+ 
+To get recommendations a database needs to have about a day of usage, and there needs to be some activity. There also needs to be some consistent activity. The SQL Database Advisor can more easily optimize for consistent query patterns than it can for random spotty bursts of activity. If recommendations are not available, the Performance recommendation page should provide a message explaining why.
+ 
+ 
+4.- Monitor the database behavior and top consumer queries/procedures.
+ 
+4a.- You can leverage some system views and review the list of queries and/or procedures that recently have consumed the most resources (duration, CPU, reads, writes, etc).
+This query should be executed against the user database that is being analyzed.
+ 
+Top 10 consumer queries
+
+SELECT TOP 10
+SUM(QUERY_STATS.TOTAL_ELAPSED_TIME) / SUM(QUERY_STATS.EXECUTION_COUNT) /1000 AS "AVG DURATION_MS",
+SUM(QUERY_STATS.TOTAL_WORKER_TIME) / SUM(QUERY_STATS.EXECUTION_COUNT) /1000 AS "AVG CPU_MS",
+SUM(QUERY_STATS.TOTAL_LOGICAL_READS) / SUM(QUERY_STATS.EXECUTION_COUNT) AS "AVG LOGICAL READS",
+SUM(QUERY_STATS.TOTAL_LOGICAL_WRITES) / SUM(QUERY_STATS.EXECUTION_COUNT) AS "AVG LOGICAL WRITES",
+SUM(QUERY_STATS.TOTAL_PHYSICAL_READS) / SUM(QUERY_STATS.EXECUTION_COUNT) AS "AVG PHYSICAL READS", 
+SUM(QUERY_STATS.EXECUTION_COUNT) AS "EXECUTION COUNT", 
+MIN(QUERY_STATS.STATEMENT_TEXT) AS "STATEMENT TEXT"
+FROM 
+    (SELECT QS.*, 
+    SUBSTRING(ST.TEXT, (QS.STATEMENT_START_OFFSET/2) + 1,
+    ((CASE STATEMENT_END_OFFSET 
+        WHEN -1 THEN DATALENGTH(ST.TEXT)
+        ELSE QS.STATEMENT_END_OFFSET END 
+            - QS.STATEMENT_START_OFFSET)/2) + 1) AS STATEMENT_TEXT
+     FROM SYS.DM_EXEC_QUERY_STATS AS QS
+     CROSS APPLY SYS.DM_EXEC_SQL_TEXT(QS.SQL_HANDLE) AS ST) AS QUERY_STATS
+GROUP BY QUERY_STATS.QUERY_HASH
+ORDER BY 1 DESC;
+GO
+
+4b.- You can leverage QDS (Query Data Store) (recommended)
+ 
+Query Store is a very powerful SQL engine feature designed to deliver insight into query performance by keeping track of different plans and execution statistics for the queries executed on the server.
+It is a database-scoped persistent store of query workload history collecting query text, query plan, and runtime stats in the user's DB for later analysis. 
+Query Store captures the query plans but also capture the execution statistics. It captures this information by time window, allowing you to perform historical analysis even after SQL Server is restarted.
+ 
+Monitoring Performance By Using the Query Store
+https://docs.microsoft.com/en-us/sql/relational-databases/performance/monitoring-performance-by-using-the-query-store
+ 
+Best Practice with the Query Store
+https://docs.microsoft.com/en-us/sql/relational-databases/performance/best-practice-with-the-query-store
+ 
+You have several ways of accessing the information.
+
+--By directly querying the QDS views, using T-SQL:
+ 
+Example:
+ 
+--Top Consumers (ordered by CPU by default) with SQL TEXT and other useful info.
+--You can order by a different metric and narrow the query down to last x hours or days, or a specific timeframe. 
+SELECT TOP 10
+       Q.QUERY_ID,
+       RS.COUNT_EXECUTIONS AS [EXECUTION COUNT],
+       RS.AVG_DURATION/1000 AS [AVG_DURATION(MS)],
+       RS.MAX_DURATION/1000 AS [MAX_DURATION(MS)],
+       RS.AVG_CPU_TIME/1000 AS [AVG_CPU_TIME(MS)],
+       RS.MAX_CPU_TIME/1000 AS [MAX_CPU_TIME(MS)],
+       RS.AVG_LOGICAL_IO_READS,
+       RS.AVG_PHYSICAL_IO_READS,
+       RS.AVG_LOGICAL_IO_WRITES,
+       RS.AVG_DOP,
+       QT.QUERY_SQL_TEXT,  
+    QT.QUERY_TEXT_ID, P.PLAN_ID, GETUTCDATE() AS CURRENTUTCTIME,  
+    RS.LAST_EXECUTION_TIME  
+FROM SYS.QUERY_STORE_QUERY_TEXT AS QT  
+JOIN SYS.QUERY_STORE_QUERY AS Q  
+    ON QT.QUERY_TEXT_ID = Q.QUERY_TEXT_ID  
+JOIN SYS.QUERY_STORE_PLAN AS P  
+    ON Q.QUERY_ID = P.QUERY_ID  
+JOIN SYS.QUERY_STORE_RUNTIME_STATS AS RS  
+    ON P.PLAN_ID = RS.PLAN_ID 
+--WHERE RS.LAST_EXECUTION_TIME BETWEEN '2/17/2016 13:00' AND '2/17/2016 14:30'
+--WHERE RS.LAST_EXECUTION_TIME > DATEADD(DAY, -7, GETUTCDATE()) 
+ORDER BY RS.AVG_CPU_TIME DESC; 
+ 
+--By using the GUI in SQL Server Management Studio:
+ 
+For this, you need to download and install the latest version of SQL Server Management Studio.
+ 
+-You can use Query Performance Insight in the Azure Portal to review DTU consumption over time, and what queries are running and consuming those resources.
+
+ Azure SQL Database Query Performance Insight
+https://docs.microsoft.com/en-us/azure/sql-database/sql-database-query-performance
+ 
+5.- Other than that, the remaining alternative is to scale the database up to a higher Service Tier / Performance Level, effectively assigning more DTUs (processing power) to it.
+You can also scale up for peak usage time or specific batch or process that you know needs more resources, and then scale back down when it’s finished.
+ 
+SQL Database Pricing
+https://azure.microsoft.com/en-us/pricing/details/sql-database/
+
